@@ -1,3 +1,7 @@
+source ~/.espressif/tools/activate_idf_v6.0.sh
+cd ~/esp32p4_projects/GPS
+
+cat > main/main.c <<'EOF'
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
@@ -26,7 +30,10 @@
 #define MODEM_BAUDRATE 115200
 #define UART_BUF_SIZE 2048
 
-#define MAX_TRACK_POINTS 300
+#define MAX_TRACK_POINTS 200
+
+#define MAP_W 900
+#define MAP_H 340
 
 static const char *TAG = "GPS_MAP";
 
@@ -40,16 +47,18 @@ static gps_point_t current_pos = {0};
 static gps_point_t track[MAX_TRACK_POINTS];
 static int track_count = 0;
 
+static SemaphoreHandle_t gps_mutex;
+
 static lv_obj_t *label_status;
 static lv_obj_t *label_lat;
 static lv_obj_t *label_lon;
 static lv_obj_t *label_points;
-static lv_obj_t *canvas;
 static lv_obj_t *label_info;
+static lv_obj_t *map_box;
+static lv_obj_t *track_line;
+static lv_obj_t *position_dot;
 
-static lv_color_t canvas_buf[900 * 360];
-
-static SemaphoreHandle_t gps_mutex;
+static lv_point_precise_t line_points[MAX_TRACK_POINTS];
 
 static void modem_send(const char *cmd)
 {
@@ -88,7 +97,7 @@ static int read_uart(char *out, size_t out_size, int timeout_ms)
             total += len;
             out[total] = '\0';
 
-            ESP_LOGI(TAG, "RX chunk: %.*s", len, (char *)data);
+            ESP_LOGI(TAG, "RX: %.*s", len, (char *)data);
         }
 
         elapsed += 200;
@@ -182,21 +191,8 @@ static void add_track_point(gps_point_t p)
     }
 }
 
-static void draw_track(void)
+static void update_track_view(void)
 {
-    lv_canvas_fill_bg(canvas, lv_color_hex(0x101820), LV_OPA_COVER);
-
-    lv_draw_line_dsc_t line_dsc;
-    lv_draw_line_dsc_init(&line_dsc);
-    line_dsc.color = lv_color_hex(0x00ff88);
-    line_dsc.width = 3;
-
-    lv_draw_rect_dsc_t dot_dsc;
-    lv_draw_rect_dsc_init(&dot_dsc);
-    dot_dsc.bg_color = lv_color_hex(0xffcc00);
-    dot_dsc.bg_opa = LV_OPA_COVER;
-    dot_dsc.radius = 5;
-
     gps_point_t local_track[MAX_TRACK_POINTS];
     int local_count = 0;
 
@@ -207,10 +203,8 @@ static void draw_track(void)
     }
 
     if (local_count <= 0) {
-        lv_obj_t *tmp = label_info;
-        if (tmp) {
-            lv_label_set_text(tmp, "Warte auf GPS-Fix...");
-        }
+        lv_line_set_points(track_line, line_points, 0);
+        lv_obj_add_flag(position_dot, LV_OBJ_FLAG_HIDDEN);
         return;
     }
 
@@ -232,31 +226,24 @@ static void draw_track(void)
     if (lat_span < 0.0001) lat_span = 0.0001;
     if (lon_span < 0.0001) lon_span = 0.0001;
 
-    int w = 900;
-    int h = 360;
     int margin = 20;
-
-    lv_point_precise_t points[MAX_TRACK_POINTS];
 
     for (int i = 0; i < local_count; i++) {
         double x_norm = (local_track[i].lon - min_lon) / lon_span;
         double y_norm = (local_track[i].lat - min_lat) / lat_span;
 
-        points[i].x = margin + (int)(x_norm * (w - 2 * margin));
-        points[i].y = h - margin - (int)(y_norm * (h - 2 * margin));
+        line_points[i].x = margin + (int)(x_norm * (MAP_W - 2 * margin));
+        line_points[i].y = MAP_H - margin - (int)(y_norm * (MAP_H - 2 * margin));
     }
 
-    if (local_count >= 2) {
-        lv_canvas_draw_line(canvas, points, local_count, &line_dsc);
-    }
+    lv_line_set_points(track_line, line_points, local_count);
 
-    lv_area_t dot_area = {
-        .x1 = points[local_count - 1].x - 5,
-        .y1 = points[local_count - 1].y - 5,
-        .x2 = points[local_count - 1].x + 5,
-        .y2 = points[local_count - 1].y + 5
-    };
-    lv_canvas_draw_rect(canvas, dot_area.x1, dot_area.y1, 10, 10, &dot_dsc);
+    lv_obj_clear_flag(position_dot, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(
+        position_dot,
+        line_points[local_count - 1].x - 6,
+        line_points[local_count - 1].y - 6
+    );
 }
 
 static void update_ui(void)
@@ -283,16 +270,17 @@ static void update_ui(void)
         lv_label_set_text(label_lat, lat_buf);
         lv_label_set_text(label_lon, lon_buf);
         lv_label_set_text(label_points, points_buf);
-        lv_label_set_text(label_info, "Lokale Track-Ansicht, noch keine Kartenkacheln");
+        lv_label_set_text(label_info, "Lokale Track-Ansicht");
 
-        draw_track();
+        update_track_view();
     } else {
         lv_label_set_text(label_status, "Fix: NEIN");
         lv_label_set_text(label_lat, "Lat: -");
         lv_label_set_text(label_lon, "Lon: -");
         lv_label_set_text(label_points, "Trackpunkte: 0");
         lv_label_set_text(label_info, "Warte auf GPS-Fix...");
-        draw_track();
+
+        update_track_view();
     }
 }
 
@@ -314,41 +302,57 @@ static void create_ui(void)
 
     lv_obj_t *title = lv_label_create(scr);
     lv_label_set_text(title, "ESP32-P4 GPS Tracker");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
 
     label_status = lv_label_create(scr);
     lv_label_set_text(label_status, "Fix: -");
-    lv_obj_align(label_status, LV_ALIGN_TOP_LEFT, 35, 70);
+    lv_obj_align(label_status, LV_ALIGN_TOP_LEFT, 35, 60);
 
     label_lat = lv_label_create(scr);
     lv_label_set_text(label_lat, "Lat: -");
-    lv_obj_align(label_lat, LV_ALIGN_TOP_LEFT, 35, 105);
+    lv_obj_align(label_lat, LV_ALIGN_TOP_LEFT, 35, 95);
 
     label_lon = lv_label_create(scr);
     lv_label_set_text(label_lon, "Lon: -");
-    lv_obj_align(label_lon, LV_ALIGN_TOP_LEFT, 35, 140);
+    lv_obj_align(label_lon, LV_ALIGN_TOP_LEFT, 35, 130);
 
     label_points = lv_label_create(scr);
     lv_label_set_text(label_points, "Trackpunkte: 0");
-    lv_obj_align(label_points, LV_ALIGN_TOP_LEFT, 35, 175);
+    lv_obj_align(label_points, LV_ALIGN_TOP_LEFT, 35, 165);
 
     label_info = lv_label_create(scr);
     lv_label_set_text(label_info, "Initialisiere...");
-    lv_obj_align(label_info, LV_ALIGN_TOP_LEFT, 35, 215);
+    lv_obj_align(label_info, LV_ALIGN_TOP_LEFT, 35, 200);
 
-    canvas = lv_canvas_create(scr);
-    lv_canvas_set_buffer(canvas, canvas_buf, 900, 360, LV_COLOR_FORMAT_RGB565);
-    lv_obj_align(canvas, LV_ALIGN_BOTTOM_MID, 0, -25);
+    map_box = lv_obj_create(scr);
+    lv_obj_set_size(map_box, MAP_W, MAP_H);
+    lv_obj_align(map_box, LV_ALIGN_BOTTOM_MID, 0, -25);
+    lv_obj_set_style_bg_color(map_box, lv_color_hex(0x101820), 0);
+    lv_obj_set_style_border_color(map_box, lv_color_hex(0x335566), 0);
+    lv_obj_set_style_border_width(map_box, 2, 0);
+    lv_obj_set_style_radius(map_box, 8, 0);
+    lv_obj_clear_flag(map_box, LV_OBJ_FLAG_SCROLLABLE);
 
-    draw_track();
+    track_line = lv_line_create(map_box);
+    lv_obj_set_style_line_color(track_line, lv_color_hex(0x00ff88), 0);
+    lv_obj_set_style_line_width(track_line, 3, 0);
+    lv_line_set_points(track_line, line_points, 0);
+
+    position_dot = lv_obj_create(map_box);
+    lv_obj_set_size(position_dot, 12, 12);
+    lv_obj_set_style_radius(position_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(position_dot, lv_color_hex(0xffcc00), 0);
+    lv_obj_set_style_border_width(position_dot, 0, 0);
+    lv_obj_add_flag(position_dot, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void modem_task(void *arg)
 {
     (void)arg;
 
-    modem_send("AT");
     char response[UART_BUF_SIZE];
+
+    modem_send("AT");
     read_uart(response, sizeof(response), 2000);
 
     modem_send("ATE0");
@@ -434,3 +438,4 @@ void app_main(void)
 
     xTaskCreate(modem_task, "modem_task", 8192, NULL, 5, NULL);
 }
+EOF
