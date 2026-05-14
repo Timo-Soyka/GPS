@@ -2,7 +2,9 @@
 
 ESP32-P4 Function EV Board V1.4 + SIM7600E-H GPS/LTE tracker.
 
-## Hardware
+This is the stable baseline version.
+
+## Hardware wiring
 
 ### SIM7600E-H UART
 
@@ -23,7 +25,7 @@ Do not connect 5V or 3V3 between the boards if the SIM7600 module is powered sep
 | PWM / Backlight | GPIO23 |
 | RST_LCD | GPIO27 |
 
-## Flash / Monitor Port
+## Flash / Monitor port
 
 Use:
 
