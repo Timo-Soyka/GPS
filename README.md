@@ -1,26 +1,25 @@
-# GPS
+# ESP32-P4 GPS Tracker
 
-ESP32-P4 Function EV Board V1.4 + SIM7600E-H GPS/LTE test project.
+GPS tracker project for the ESP32-P4 Function EV Board V1.4 with a SIM7600E-H module.
 
-## Current working setup
+## Current status
 
-The SIM7600E-H is connected to the ESP32-P4 via UART pins.
+Working:
 
-## Wiring
+- ESP32-P4 boots correctly
+- LCD initializes correctly
+- Backlight works
+- Touch controller GT911 initializes
+- SIM7600E-H responds over UART
+- GNSS polling via `AT+CGPSINFO`
+- GPS data is shown on the LCD when a fix is available
+- Local track display area is prepared
 
-SIM7600 UART jumpers: **B**
+## Hardware
 
-| ESP32-P4 | SIM7600E-H |
-|---|---|
-| GPIO7 TX | RXD |
-| GPIO8 RX | TXD |
-| GND | GND |
+### ESP32-P4 Function EV Board
 
-Do not connect 5V or 3V3 between the boards if the SIM7600 module is powered separately.
+Flash/monitor port:
 
-## Flash / Monitor port
-
-Use:
-
-```bash
+```text
 /dev/cu.SLAB_USBtoUART
