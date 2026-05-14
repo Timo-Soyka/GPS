@@ -5,7 +5,6 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
 
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -28,32 +27,18 @@
    LCD:
    PWM / Backlight -> GPIO23
    RST_LCD         -> GPIO27
+
+   Flash / Monitor:
+   /dev/cu.SLAB_USBtoUART
 */
+
 #define MODEM_TX_GPIO 21
 #define MODEM_RX_GPIO 22
 
 #define MODEM_BAUDRATE 115200
 #define UART_BUF_SIZE 2048
 
-static const char *TAG = "GPS_LCD";
-
-typedef struct {
-    double lat;
-    double lon;
-    bool valid;
-} gps_position_t;
-
-static SemaphoreHandle_t gps_mutex;
-static gps_position_t gps_pos = {0};
-static int gps_updates = 0;
-
-static lv_obj_t *label_status;
-static lv_obj_t *label_lat;
-static lv_obj_t *label_lon;
-static lv_obj_t *label_updates;
-static lv_obj_t *label_raw;
-static lv_obj_t *map_box;
-static lv_obj_t *position_dot;
+static const char *TAG = "GPS_STABLE";
 
 static void modem_send(const char *cmd)
 {
@@ -101,62 +86,6 @@ static int read_uart(char *out, size_t out_size, int timeout_ms)
     return total;
 }
 
-static double nmea_to_decimal(const char *value, char hemi)
-{
-    double raw = atof(value);
-    int degrees = (int)(raw / 100);
-    double minutes = raw - (degrees * 100);
-    double decimal = degrees + (minutes / 60.0);
-
-    if (hemi == 'S' || hemi == 'W') {
-        decimal = -decimal;
-    }
-
-    return decimal;
-}
-
-static bool parse_cgpsinfo(const char *response, gps_position_t *pos)
-{
-    const char *p = strstr(response, "+CGPSINFO:");
-    if (!p) {
-        return false;
-    }
-
-    p += strlen("+CGPSINFO:");
-
-    while (*p == ' ') {
-        p++;
-    }
-
-    char lat_raw[24] = {0};
-    char lon_raw[24] = {0};
-    char lat_hemi = 0;
-    char lon_hemi = 0;
-
-    int matched = sscanf(
-        p,
-        "%23[^,],%c,%23[^,],%c",
-        lat_raw,
-        &lat_hemi,
-        lon_raw,
-        &lon_hemi
-    );
-
-    if (matched != 4) {
-        return false;
-    }
-
-    if (strlen(lat_raw) < 3 || strlen(lon_raw) < 4) {
-        return false;
-    }
-
-    pos->lat = nmea_to_decimal(lat_raw, lat_hemi);
-    pos->lon = nmea_to_decimal(lon_raw, lon_hemi);
-    pos->valid = true;
-
-    return true;
-}
-
 static void uart_init_modem(void)
 {
     uart_config_t uart_config = {
@@ -202,33 +131,27 @@ static void create_ui(void)
     lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
 
-    label_status = lv_label_create(scr);
-    lv_label_set_text(label_status, "Fix: -");
-    lv_obj_set_style_text_color(label_status, lv_color_hex(0xff4444), 0);
-    lv_obj_align(label_status, LV_ALIGN_TOP_LEFT, 35, 70);
+    lv_obj_t *status = lv_label_create(scr);
+    lv_label_set_text(status, "LCD OK - SIM7600 GPS aktiv");
+    lv_obj_set_style_text_color(status, lv_color_hex(0x44ff44), 0);
+    lv_obj_align(status, LV_ALIGN_TOP_LEFT, 35, 75);
 
-    label_lat = lv_label_create(scr);
-    lv_label_set_text(label_lat, "Lat: -");
-    lv_obj_set_style_text_color(label_lat, lv_color_hex(0xffffff), 0);
-    lv_obj_align(label_lat, LV_ALIGN_TOP_LEFT, 35, 105);
+    lv_obj_t *uart = lv_label_create(scr);
+    lv_label_set_text(uart, "UART: GPIO21 TX -> RXD | GPIO22 RX <- TXD");
+    lv_obj_set_style_text_color(uart, lv_color_hex(0xffffff), 0);
+    lv_obj_align(uart, LV_ALIGN_TOP_LEFT, 35, 115);
 
-    label_lon = lv_label_create(scr);
-    lv_label_set_text(label_lon, "Lon: -");
-    lv_obj_set_style_text_color(label_lon, lv_color_hex(0xffffff), 0);
-    lv_obj_align(label_lon, LV_ALIGN_TOP_LEFT, 35, 140);
+    lv_obj_t *gps = lv_label_create(scr);
+    lv_label_set_text(gps, "GPS-Daten erscheinen aktuell im Terminal.");
+    lv_obj_set_style_text_color(gps, lv_color_hex(0xffffff), 0);
+    lv_obj_align(gps, LV_ALIGN_TOP_LEFT, 35, 155);
 
-    label_updates = lv_label_create(scr);
-    lv_label_set_text(label_updates, "Updates: 0");
-    lv_obj_set_style_text_color(label_updates, lv_color_hex(0xffffff), 0);
-    lv_obj_align(label_updates, LV_ALIGN_TOP_LEFT, 35, 175);
+    lv_obj_t *info = lv_label_create(scr);
+    lv_label_set_text(info, "Stabile Basisversion ohne Track-Zeichnung.");
+    lv_obj_set_style_text_color(info, lv_color_hex(0xffffff), 0);
+    lv_obj_align(info, LV_ALIGN_TOP_LEFT, 35, 195);
 
-    label_raw = lv_label_create(scr);
-    lv_label_set_text(label_raw, "Warte auf GPS-Daten...");
-    lv_obj_set_style_text_color(label_raw, lv_color_hex(0xffffff), 0);
-    lv_obj_set_width(label_raw, 900);
-    lv_obj_align(label_raw, LV_ALIGN_TOP_LEFT, 35, 215);
-
-    map_box = lv_obj_create(scr);
+    lv_obj_t *map_box = lv_obj_create(scr);
     lv_obj_set_size(map_box, 900, 320);
     lv_obj_align(map_box, LV_ALIGN_BOTTOM_MID, 0, -25);
     lv_obj_set_style_bg_color(map_box, lv_color_hex(0x101820), 0);
@@ -238,67 +161,9 @@ static void create_ui(void)
     lv_obj_clear_flag(map_box, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *map_label = lv_label_create(map_box);
-    lv_label_set_text(map_label, "Lokale Track-Ansicht");
+    lv_label_set_text(map_label, "Kartenbereich - wird spaeter wieder aktiviert");
     lv_obj_set_style_text_color(map_label, lv_color_hex(0xffffff), 0);
-    lv_obj_align(map_label, LV_ALIGN_TOP_MID, 0, 20);
-
-    position_dot = lv_obj_create(map_box);
-    lv_obj_set_size(position_dot, 18, 18);
-    lv_obj_set_style_radius(position_dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(position_dot, lv_color_hex(0xffcc00), 0);
-    lv_obj_set_style_border_width(position_dot, 0, 0);
-    lv_obj_center(position_dot);
-    lv_obj_add_flag(position_dot, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void update_ui(void)
-{
-    gps_position_t local_pos = {0};
-    int local_updates = 0;
-
-    if (xSemaphoreTake(gps_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        local_pos = gps_pos;
-        local_updates = gps_updates;
-        xSemaphoreGive(gps_mutex);
-    }
-
-    char updates_buf[64];
-    snprintf(updates_buf, sizeof(updates_buf), "Updates: %d", local_updates);
-    lv_label_set_text(label_updates, updates_buf);
-
-    if (local_pos.valid) {
-        char lat_buf[64];
-        char lon_buf[64];
-
-        snprintf(lat_buf, sizeof(lat_buf), "Lat: %.6f", local_pos.lat);
-        snprintf(lon_buf, sizeof(lon_buf), "Lon: %.6f", local_pos.lon);
-
-        lv_obj_set_style_text_color(label_status, lv_color_hex(0x44ff44), 0);
-        lv_label_set_text(label_status, "Fix: JA");
-        lv_label_set_text(label_lat, lat_buf);
-        lv_label_set_text(label_lon, lon_buf);
-        lv_label_set_text(label_raw, "GPS-Fix aktiv. Position wird lokal angezeigt.");
-
-        lv_obj_clear_flag(position_dot, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_center(position_dot);
-    } else {
-        lv_obj_set_style_text_color(label_status, lv_color_hex(0xff4444), 0);
-        lv_label_set_text(label_status, "Fix: NEIN");
-        lv_label_set_text(label_lat, "Lat: -");
-        lv_label_set_text(label_lon, "Lon: -");
-        lv_label_set_text(label_raw, "GNSS aktiv. Warte auf gueltigen Fix...");
-        lv_obj_add_flag(position_dot, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-static void ui_timer_cb(lv_timer_t *timer)
-{
-    (void)timer;
-
-    if (bsp_display_lock(0)) {
-        update_ui();
-        bsp_display_unlock();
-    }
+    lv_obj_center(map_label);
 }
 
 static void modem_task(void *arg)
@@ -326,36 +191,16 @@ static void modem_task(void *arg)
 
     while (1) {
         modem_send("AT+CGPSINFO");
-
-        int len = read_uart(response, sizeof(response), 5000);
-
-        if (len > 0) {
-            gps_position_t parsed = {0};
-
-            if (parse_cgpsinfo(response, &parsed)) {
-                ESP_LOGI(TAG, "GPS FIX: lat=%.6f lon=%.6f", parsed.lat, parsed.lon);
-
-                if (xSemaphoreTake(gps_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    gps_pos = parsed;
-                    gps_updates++;
-                    xSemaphoreGive(gps_mutex);
-                }
-            } else {
-                ESP_LOGI(TAG, "No valid GPS fix yet");
-            }
-        }
-
+        read_uart(response, sizeof(response), 5000);
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting GPS LCD tracker");
+    ESP_LOGI(TAG, "Starting stable GPS LCD version");
     ESP_LOGI(TAG, "ESP GPIO%d TX -> SIM7600 RXD", MODEM_TX_GPIO);
     ESP_LOGI(TAG, "ESP GPIO%d RX <- SIM7600 TXD", MODEM_RX_GPIO);
-
-    gps_mutex = xSemaphoreCreateMutex();
 
     uart_init_modem();
 
@@ -373,7 +218,9 @@ void app_main(void)
         bsp_display_unlock();
     }
 
-    lv_timer_create(ui_timer_cb, 1000, NULL);
-
     xTaskCreate(modem_task, "modem_task", 8192, NULL, 5, NULL);
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
 }
